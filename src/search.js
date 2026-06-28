@@ -8,6 +8,7 @@ const TIMEOUT_MS = 10_000;
 const KEY_DELAY_MS = 40;
 const FOCUS_SETTLE_MS = 100;
 const DOWNLOAD_LIMIT = Number(process.env.DOWNLOAD_LIMIT || 10);
+const ARTIFACTS_DIR = process.env.ARTIFACTS_DIR || "artifacts";
 
 const DOCUMENT_TABS = Object.freeze({
   EXHIBITS: "Exhibits",
@@ -50,6 +51,10 @@ function normalizeTabName(tabName) {
 
 function artifactSafeName(value) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function artifactPath(name) {
+  return `${ARTIFACTS_DIR}/${name}`;
 }
 
 function fileSafeName(value) {
@@ -109,12 +114,14 @@ async function searchMatter(page) {
 
   const typedMatterNo = (await directInput.innerText()).trim();
   if (typedMatterNo !== MATTER_NO) {
-    await page.screenshot({ path: "artifacts/input-mismatch.png", fullPage: true });
+    await fs.mkdir(ARTIFACTS_DIR, { recursive: true });
+    await page.screenshot({ path: artifactPath("input-mismatch.png"), fullPage: true });
     throw new Error(`Matter input mismatch: expected ${MATTER_NO}, got ${typedMatterNo || "<blank>"}`);
   }
 
   if (DEBUG) {
-    await page.screenshot({ path: "artifacts/after-type.png", fullPage: true });
+    await fs.mkdir(ARTIFACTS_DIR, { recursive: true });
+    await page.screenshot({ path: artifactPath("after-type.png"), fullPage: true });
   }
 
   await page.locator("#b0p0o258i0i0r1").click({ force: true });
@@ -366,7 +373,29 @@ async function getVisibleDownloadModalText(page) {
   return (await modal.innerText().catch(() => "")).trim();
 }
 
+async function clickDownloadButtonWithRetry(page, downloadButton, attempts = 3) {
+  const errors = [];
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const downloadPromise = page.waitForEvent("download", { timeout: TIMEOUT_MS });
+      if (attempt === 1) {
+        await clickByCenter(page, downloadButton);
+      } else {
+        await downloadButton.click({ force: true });
+      }
+      return await downloadPromise;
+    } catch (err) {
+      errors.push(`attempt ${attempt}: ${err.message}`);
+      await page.waitForTimeout(500);
+    }
+  }
+
+  throw new Error(`Download button did not emit a download event after ${attempts} attempts. ${errors.join(" | ")}`);
+}
+
 async function downloadSelectedDocuments(page, documents, outputDir) {
+  await fs.rm(outputDir, { recursive: true, force: true });
   await fs.mkdir(outputDir, { recursive: true });
 
   const downloads = [];
@@ -396,9 +425,7 @@ async function downloadSelectedDocuments(page, documents, outputDir) {
       const downloadButton = rowDownloadModal.locator(".fm-download-button", { hasText: expectedFilePattern }).first();
       await downloadButton.waitFor({ state: "visible", timeout: TIMEOUT_MS });
 
-      const downloadPromise = page.waitForEvent("download", { timeout: TIMEOUT_MS });
-      await clickByCenter(page, downloadButton);
-      const download = await downloadPromise;
+      const download = await clickDownloadButtonWithRetry(page, downloadButton);
       const suggestedFilename = download.suggestedFilename();
       if (suggestedFilename.toLowerCase() !== expectedFilename.toLowerCase()) {
         throw new Error(`Expected ${expectedFilename}, but WebDirect downloaded ${suggestedFilename}`);
@@ -437,7 +464,7 @@ async function downloadSelectedDocuments(page, documents, outputDir) {
 }
 
 async function main() {
-  await fs.mkdir("artifacts", { recursive: true });
+  await fs.mkdir(ARTIFACTS_DIR, { recursive: true });
 
   const browser = await chromium.launch({
     headless: true,
@@ -460,14 +487,14 @@ async function main() {
 
   const documents = await collectDocumentRows(page);
   const selectedDownloads = selectDocumentsForDownload(documents);
-  const downloadDir = `artifacts/${MATTER_NO}-${tabSlug}-downloads`;
+  const downloadDir = artifactPath(`${MATTER_NO}-${tabSlug}-downloads`);
   const downloads = await downloadSelectedDocuments(page, selectedDownloads, downloadDir);
   await closeOpenModal(page);
 
-  await page.screenshot({ path: `artifacts/${MATTER_NO}-${tabSlug}.png`, fullPage: true });
-  await fs.writeFile(`artifacts/${MATTER_NO}-${tabSlug}.html`, await page.content());
+  await page.screenshot({ path: artifactPath(`${MATTER_NO}-${tabSlug}.png`), fullPage: true });
+  await fs.writeFile(artifactPath(`${MATTER_NO}-${tabSlug}.html`), await page.content());
   await fs.writeFile(
-    `artifacts/${MATTER_NO}-${tabSlug}-documents.json`,
+    artifactPath(`${MATTER_NO}-${tabSlug}-documents.json`),
     JSON.stringify(
       {
         matterNo: MATTER_NO,
@@ -483,7 +510,7 @@ async function main() {
     )
   );
   await fs.writeFile(
-    `artifacts/${MATTER_NO}-${tabSlug}-downloads.json`,
+    artifactPath(`${MATTER_NO}-${tabSlug}-downloads.json`),
     JSON.stringify(
       {
         matterNo: MATTER_NO,
