@@ -12,6 +12,9 @@ const ROOT_DIR = path.resolve(__dirname, "..");
 const ARTIFACTS_DIR = path.join(ROOT_DIR, "artifacts");
 const SEARCH_SCRIPT = path.join(ROOT_DIR, "src", "search.js");
 const DOWNLOAD_LIMIT = process.env.DOWNLOAD_LIMIT || "10";
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const OPENROUTER_PARSE_MODEL = process.env.OPENROUTER_PARSE_MODEL || "";
+const OPENROUTER_REPLY_MODEL = process.env.OPENROUTER_REPLY_MODEL || "";
 
 const DOCUMENT_TABS = Object.freeze({
   EXHIBITS: "Exhibits",
@@ -49,6 +52,18 @@ let activeJob = null;
 
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 app.use(express.json({ limit: "25mb" }));
+
+function requireEnv(name) {
+  if (!process.env[name]) {
+    throw new Error(`${name} is required.`);
+  }
+}
+
+function validateConfig() {
+  requireEnv("OPENROUTER_API_KEY");
+  requireEnv("OPENROUTER_PARSE_MODEL");
+  requireEnv("OPENROUTER_REPLY_MODEL");
+}
 
 function normalizeTabName(tabName) {
   const key = String(tabName || "").trim().toLowerCase().replace(/-/g, "_");
@@ -107,6 +122,46 @@ function replySubject(subject, matterNo, tab) {
   return /^re:/i.test(cleanSubject) ? cleanSubject : `Re: ${cleanSubject}`;
 }
 
+function elapsedSeconds(startedAt) {
+  return `${((Date.now() - startedAt) / 1000).toFixed(1)}s`;
+}
+
+function parseJsonObject(value) {
+  const text = String(value || "").trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1].trim() : text;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error("AI response did not contain a JSON object.");
+  }
+  return JSON.parse(candidate.slice(start, end + 1));
+}
+
+async function openRouterChat({ model, messages, temperature = 0.1 }) {
+  if (!OPENROUTER_API_KEY || !model) {
+    throw new Error("OpenRouter is not configured.");
+  }
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": process.env.OPENROUTER_SITE_URL || "http://localhost",
+      "X-Title": process.env.OPENROUTER_APP_NAME || "UARB Documents Agent",
+    },
+    body: JSON.stringify({ model, messages, temperature }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenRouter failed ${response.status}: ${await response.text()}`);
+  }
+
+  const json = await response.json();
+  return json.choices?.[0]?.message?.content || "";
+}
+
 function parseRequestText(subject, plainText) {
   const cleanSubject = subject && subject !== "(empty)" ? subject : "";
   const source = `${cleanSubject}\n${plainText || ""}`
@@ -114,15 +169,57 @@ function parseRequestText(subject, plainText) {
     .map((line) => line.trim())
     .filter(Boolean)
     .join(" ");
-  const match = source.match(/\b(M\d+)\b\s+(.+)/i);
-  if (!match) {
-    throw new Error('Expected email text like "M12205 other_documents".');
+  const matterMatch = source.match(/\b(M\d+)\b/i);
+  if (!matterMatch) throw new Error('Expected email text with a matter number like "M12205".');
+
+  const matterNo = matterMatch[1].toUpperCase();
+  const tabAlias = Array.from(TAB_ALIASES.keys())
+    .sort((a, b) => b.length - a.length)
+    .find((alias) => {
+      const pattern = alias
+        .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+        .replace(/[ _-]+/g, "[\\s_-]+");
+      return new RegExp(`\\b${pattern}\\b`, "i").test(source);
+    });
+  if (!tabAlias) {
+    throw new Error(`Expected email text with one document type: ${Object.values(DOCUMENT_TABS).join(", ")}.`);
   }
 
-  const matterNo = match[1].toUpperCase();
-  const requestedType = match[2].trim().replace(/\s+/g, " ");
+  const requestedType = tabAlias;
   const tab = normalizeTabName(requestedType);
   return { matterNo, requestedType, tab, tabSlug: artifactSafeName(tab) };
+}
+
+async function parseRequestWithAi(subject, plainText) {
+  const content = await openRouterChat({
+    model: OPENROUTER_PARSE_MODEL,
+    messages: [
+      {
+        role: "system",
+        content: [
+          "Extract the Nova Scotia UARB matter number and requested document tab from an inbound email.",
+          "Matter numbers look like M12205 or M12383.",
+          "Valid document tabs are Exhibits, Key Documents, Other Documents, Transcripts, and Recordings.",
+          "Return only JSON with keys matterNo and documentType.",
+        ].join(" "),
+      },
+      {
+        role: "user",
+        content: `Subject:\n${subject || ""}\n\nBody:\n${plainText || ""}`,
+      },
+    ],
+  });
+
+  const parsed = parseJsonObject(content);
+  const matterNo = String(parsed.matterNo || "").trim().toUpperCase();
+  if (!/^M\d+$/i.test(matterNo)) throw new Error("AI did not return a valid matter number.");
+  const tab = normalizeTabName(parsed.documentType);
+  return {
+    matterNo,
+    requestedType: parsed.documentType,
+    tab,
+    tabSlug: artifactSafeName(tab),
+  };
 }
 
 function validateMailgunSignature(body) {
@@ -192,8 +289,11 @@ async function createDownloadsZip(job) {
   const downloadDir = path.join(job.artifactsDir, `${job.matterNo}-${job.tabSlug}-downloads`);
   const reportPath = path.join(job.artifactsDir, `${job.matterNo}-${job.tabSlug}-downloads.json`);
   const zipPath = path.join(job.artifactsDir, `${job.matterNo}-${job.tabSlug}-${job.id}.zip`);
+  const documentsPath = path.join(job.artifactsDir, `${job.matterNo}-${job.tabSlug}-documents.json`);
+  const screenshotPath = path.join(job.artifactsDir, `${job.matterNo}-${job.tabSlug}.png`);
 
   const report = JSON.parse(await fs.readFile(reportPath, "utf8"));
+  const documents = JSON.parse(await fs.readFile(documentsPath, "utf8"));
   if (!report.succeeded) {
     throw new Error(`No documents downloaded for ${job.matterNo} ${job.tab}.`);
   }
@@ -209,30 +309,117 @@ async function createDownloadsZip(job) {
 
   const zip = new AdmZip();
   zip.addLocalFolder(downloadDir);
-  zip.addLocalFile(reportPath);
   zip.writeZip(zipPath);
-  return { zipPath, report };
+  return { zipPath, report, documents, screenshotPath };
+}
+
+async function buildReplyText(job, report, documents, screenshotPath) {
+  const downloadedDocs = (report.downloads || []).filter((download) => download.ok);
+  const metadata = {
+    matterNo: job.matterNo,
+    requestedTab: job.tab,
+    selectedTabDocumentCount: documents.count,
+    requestedDownloadCount: report.requested,
+    successfulDownloadCount: report.succeeded,
+    failedDownloadCount: report.failed,
+    downloadedDocuments: downloadedDocs.map((doc) => ({
+      docNo: doc.docNo,
+      title: doc.title,
+      date: doc.date,
+      security: doc.security,
+      extension: doc.extension,
+      filename: doc.suggestedFilename,
+      bytes: doc.bytes,
+    })),
+    allDocumentsInSelectedTab: documents.documents,
+  };
+
+  const content = [
+    {
+      type: "text",
+      text: [
+        "Draft a concise plain-text email body from the UARB Documents Agent.",
+        "The ZIP of downloaded documents will be attached by the system; do not claim any other attachments.",
+        "Use a short, professional, high-information overview.",
+        "No warmup, no greeting like Dear, no sign-off, and no closing signature.",
+        "Do not use Markdown, asterisks, bold markers, tables, or decorative formatting.",
+        "Avoid repetition.",
+        "Summarize the matter metadata visible in the screenshot when available, including title, type/category, date received, and final submissions date.",
+        "State total count in the requested tab and how many selected documents were downloaded.",
+        "Mention the downloaded document names/titles briefly without listing excessive detail.",
+        "Do not mention internal JSON, scraping, Playwright, OpenRouter, or implementation details.",
+        "",
+        "Original inbound email:",
+        `Subject: ${job.subject || ""}`,
+        `Body: ${job.body || ""}`,
+        "",
+        "Structured retrieval metadata JSON:",
+        JSON.stringify(metadata, null, 2),
+      ].join("\n"),
+    },
+  ];
+
+  const image = await fs.readFile(screenshotPath).catch(() => null);
+  if (image) {
+    content.push({
+      type: "image_url",
+      image_url: {
+        url: `data:image/png;base64,${image.toString("base64")}`,
+      },
+    });
+  }
+
+  const reply = await openRouterChat({
+    model: OPENROUTER_REPLY_MODEL,
+    temperature: 0.2,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You write concise, professional plain-text regulatory document retrieval email bodies. Never use Markdown bold, a Dear greeting, or a sign-off.",
+      },
+      { role: "user", content },
+    ],
+  });
+
+  const trimmed = reply.trim();
+  if (!trimmed) throw new Error("OpenRouter reply model returned an empty email body.");
+  return trimmed;
 }
 
 async function handleInboundJob(job) {
+  const jobStartedAt = Date.now();
+  const parsedStartedAt = Date.now();
+  Object.assign(job, await parseRequestWithAi(job.subject, job.body));
+  job.artifactsDir = path.join(ARTIFACTS_DIR, "jobs", job.id);
+  console.log(`Job ${job.id}: parse ${elapsedSeconds(parsedStartedAt)} (${job.matterNo} ${job.tab})`);
+
   console.log(`Job ${job.id}: fetching ${job.matterNo} ${job.tab} for ${job.replyTo}`);
   await fs.mkdir(job.artifactsDir, { recursive: true });
-  await runSearchScript(job);
-  const { zipPath, report } = await createDownloadsZip(job);
 
+  const searchStartedAt = Date.now();
+  await runSearchScript(job);
+  console.log(`Job ${job.id}: search ${elapsedSeconds(searchStartedAt)}`);
+
+  const zipStartedAt = Date.now();
+  const { zipPath, report, documents, screenshotPath } = await createDownloadsZip(job);
+  console.log(`Job ${job.id}: zip ${elapsedSeconds(zipStartedAt)}`);
+
+  const replyStartedAt = Date.now();
+  const replyText = await buildReplyText(job, report, documents, screenshotPath);
+  console.log(`Job ${job.id}: ai-reply ${elapsedSeconds(replyStartedAt)}`);
+
+  const sendStartedAt = Date.now();
   await sendMailgunMessage({
     to: job.replyTo,
     subject: replySubject(job.subject, job.matterNo, job.tab),
-    text: [
-      `Attached are the downloaded ${job.tab} documents for ${job.matterNo}.`,
-      "",
-      `Downloaded ${report.succeeded} of ${report.requested} selected documents.`,
-    ].join("\n"),
+    text: replyText,
     attachmentPath: zipPath,
     inReplyTo: job.messageId,
     references: job.references || job.messageId,
   });
-  console.log(`Job ${job.id}: sent ${zipPath} to ${job.replyTo}`);
+  console.log(`Job ${job.id}: mailgun ${elapsedSeconds(sendStartedAt)}`);
+  console.log(`Job ${job.id}: done ${elapsedSeconds(jobStartedAt)} (${zipPath})`);
 }
 
 async function sendFailureReply(job, err) {
@@ -254,7 +441,7 @@ async function sendMailgunMessage({ to, subject, text, attachmentPath, inReplyTo
   }
 
   const form = new FormData();
-  form.set("from", process.env.MAILGUN_FROM || `Senpilot <agent@${domain}>`);
+  form.set("from", process.env.MAILGUN_FROM || `UARB Documents Agent <agent@${domain}>`);
   form.set("to", to);
   form.set("subject", subject);
   form.set("text", text);
@@ -279,7 +466,7 @@ async function sendMailgunMessage({ to, subject, text, attachmentPath, inReplyTo
   }
 }
 
-app.post("/mailgun/inbound", (req, res) => {
+app.post("/mailgun/inbound", async (req, res) => {
   if (!validateMailgunSignature(req.body || {})) {
     return res.status(401).json({ error: "Invalid Mailgun signature" });
   }
@@ -292,7 +479,6 @@ app.post("/mailgun/inbound", (req, res) => {
     const replyTo = extractEmailAddress(sender);
     if (!replyTo) throw new Error("Missing sender.");
 
-    const parsed = parseRequestText(subject, plainText);
     const job = {
       id: crypto.randomUUID(),
       replyTo,
@@ -301,18 +487,14 @@ app.post("/mailgun/inbound", (req, res) => {
       body: plainText,
       messageId,
       references: field(req.body, "References", "references"),
-      ...parsed,
       receivedAt: new Date().toISOString(),
     };
-    job.artifactsDir = path.join(ARTIFACTS_DIR, "jobs", job.id);
 
     enqueueJob(job);
     return res.status(202).json({
       ok: true,
       queued: true,
       jobId: job.id,
-      matterNo: job.matterNo,
-      documentType: job.tab,
     });
   } catch (err) {
     return res.status(400).json({ error: err.message });
@@ -327,7 +509,9 @@ app.get("/health", (req, res) => {
   });
 });
 
+validateConfig();
+
 app.listen(PORT, () => {
-  console.log(`Senpilot webhook server listening on :${PORT}`);
+  console.log(`UARB Documents Agent webhook server listening on :${PORT}`);
   console.log(`Mailgun inbound endpoint: POST /mailgun/inbound`);
 });

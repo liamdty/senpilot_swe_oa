@@ -394,69 +394,85 @@ async function clickDownloadButtonWithRetry(page, downloadButton, attempts = 3) 
   throw new Error(`Download button did not emit a download event after ${attempts} attempts. ${errors.join(" | ")}`);
 }
 
+async function downloadOneDocument(page, doc, index, outputDir, retryPass = 0) {
+  const extension = doc.extension || ".pdf";
+  const expectedFilename = expectedDownloadFilename(doc);
+  const filename = `${String(index + 1).padStart(2, "0")}-${fileSafeName(doc.docNo)}${extension}`;
+  const path = `${outputDir}/${filename}`;
+  const startedAt = Date.now();
+
+  try {
+    await closeOpenModal(page);
+    const actionPoint = await scrollUntilRowActionVisible(page, doc.docNo);
+    await page.mouse.click(actionPoint.x, actionPoint.y);
+
+    const expectedFilePattern = new RegExp(`^${escapeRegExp(expectedFilename)}$`, "i");
+    const rowDownloadModal = page
+      .locator(".v-window", {
+        hasText: new RegExp(`Download Files[\\s\\S]*${escapeRegExp(expectedFilename)}`, "i"),
+      })
+      .first();
+    await rowDownloadModal.waitFor({
+      state: "visible",
+      timeout: TIMEOUT_MS,
+    });
+
+    const downloadButton = rowDownloadModal.locator(".fm-download-button", { hasText: expectedFilePattern }).first();
+    await downloadButton.waitFor({ state: "visible", timeout: TIMEOUT_MS });
+
+    const download = await clickDownloadButtonWithRetry(page, downloadButton);
+    const suggestedFilename = download.suggestedFilename();
+    if (suggestedFilename.toLowerCase() !== expectedFilename.toLowerCase()) {
+      throw new Error(`Expected ${expectedFilename}, but WebDirect downloaded ${suggestedFilename}`);
+    }
+
+    await download.saveAs(path);
+    await closeOpenModal(page);
+
+    const stat = await fs.stat(path);
+    return {
+      ...doc,
+      ok: true,
+      retryPass,
+      downloadUrl: download.url(),
+      expectedFilename,
+      suggestedFilename,
+      bytes: stat.size,
+      elapsedMs: Date.now() - startedAt,
+      path,
+    };
+  } catch (err) {
+    const modalText = await getVisibleDownloadModalText(page);
+    await closeOpenModal(page);
+    return {
+      ...doc,
+      ok: false,
+      retryPass,
+      expectedFilename,
+      elapsedMs: Date.now() - startedAt,
+      modalText,
+      error: err.message,
+    };
+  }
+}
+
 async function downloadSelectedDocuments(page, documents, outputDir) {
   await fs.rm(outputDir, { recursive: true, force: true });
   await fs.mkdir(outputDir, { recursive: true });
 
   const downloads = [];
   for (const [index, doc] of documents.entries()) {
-    const extension = doc.extension || ".pdf";
-    const expectedFilename = expectedDownloadFilename(doc);
-    const filename = `${String(index + 1).padStart(2, "0")}-${fileSafeName(doc.docNo)}${extension}`;
-    const path = `${outputDir}/${filename}`;
-    const startedAt = Date.now();
+    downloads.push(await downloadOneDocument(page, doc, index, outputDir));
+  }
 
-    try {
-      await closeOpenModal(page);
-      const actionPoint = await scrollUntilRowActionVisible(page, doc.docNo);
-      await page.mouse.click(actionPoint.x, actionPoint.y);
-
-      const expectedFilePattern = new RegExp(`^${escapeRegExp(expectedFilename)}$`, "i");
-      const rowDownloadModal = page
-        .locator(".v-window", {
-          hasText: new RegExp(`Download Files[\\s\\S]*${escapeRegExp(expectedFilename)}`, "i"),
-        })
-        .first();
-      await rowDownloadModal.waitFor({
-        state: "visible",
-        timeout: TIMEOUT_MS,
-      });
-
-      const downloadButton = rowDownloadModal.locator(".fm-download-button", { hasText: expectedFilePattern }).first();
-      await downloadButton.waitFor({ state: "visible", timeout: TIMEOUT_MS });
-
-      const download = await clickDownloadButtonWithRetry(page, downloadButton);
-      const suggestedFilename = download.suggestedFilename();
-      if (suggestedFilename.toLowerCase() !== expectedFilename.toLowerCase()) {
-        throw new Error(`Expected ${expectedFilename}, but WebDirect downloaded ${suggestedFilename}`);
-      }
-
-      await download.saveAs(path);
-      await closeOpenModal(page);
-
-      const stat = await fs.stat(path);
-      downloads.push({
-        ...doc,
-        ok: true,
-        downloadUrl: download.url(),
-        expectedFilename,
-        suggestedFilename,
-        bytes: stat.size,
-        elapsedMs: Date.now() - startedAt,
-        path,
-      });
-    } catch (err) {
-      const modalText = await getVisibleDownloadModalText(page);
-      await closeOpenModal(page);
-      downloads.push({
-        ...doc,
-        ok: false,
-        expectedFilename,
-        elapsedMs: Date.now() - startedAt,
-        modalText,
-        error: err.message,
-      });
+  for (const [index, result] of downloads.entries()) {
+    if (result.ok) continue;
+    const retried = await downloadOneDocument(page, documents[index], index, outputDir, 1);
+    if (!retried.ok) {
+      retried.previousError = result.error;
+      retried.previousModalText = result.modalText;
     }
+    downloads[index] = retried;
   }
 
   await scrollGridToTop(page);
