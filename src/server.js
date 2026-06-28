@@ -11,7 +11,6 @@ const PORT = Number(process.env.PORT || 3000);
 const ROOT_DIR = path.resolve(__dirname, "..");
 const ARTIFACTS_DIR = path.join(ROOT_DIR, "artifacts");
 const SEARCH_SCRIPT = path.join(ROOT_DIR, "src", "search.js");
-const DOWNLOAD_LIMIT = process.env.DOWNLOAD_LIMIT || "10";
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENROUTER_PARSE_MODEL = process.env.OPENROUTER_PARSE_MODEL || "";
 const OPENROUTER_REPLY_MODEL = process.env.OPENROUTER_REPLY_MODEL || "";
@@ -126,6 +125,21 @@ function elapsedSeconds(startedAt) {
   return `${((Date.now() - startedAt) / 1000).toFixed(1)}s`;
 }
 
+function jobArtifactPaths(job) {
+  const base = `${job.matterNo}-${job.tabSlug}`;
+  return {
+    downloadDir: path.join(job.artifactsDir, `${base}-downloads`),
+    documentsPath: path.join(job.artifactsDir, `${base}-documents.json`),
+    downloadsPath: path.join(job.artifactsDir, `${base}-downloads.json`),
+    screenshotPath: path.join(job.artifactsDir, `${base}.png`),
+    zipPath: path.join(job.artifactsDir, `${base}-${job.id}.zip`),
+  };
+}
+
+function successfulDownloads(report) {
+  return (report.downloads || []).filter((download) => download.ok);
+}
+
 function parseJsonObject(value) {
   const text = String(value || "").trim();
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -160,34 +174,6 @@ async function openRouterChat({ model, messages, temperature = 0.1 }) {
 
   const json = await response.json();
   return json.choices?.[0]?.message?.content || "";
-}
-
-function parseRequestText(subject, plainText) {
-  const cleanSubject = subject && subject !== "(empty)" ? subject : "";
-  const source = `${cleanSubject}\n${plainText || ""}`
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .join(" ");
-  const matterMatch = source.match(/\b(M\d+)\b/i);
-  if (!matterMatch) throw new Error('Expected email text with a matter number like "M12205".');
-
-  const matterNo = matterMatch[1].toUpperCase();
-  const tabAlias = Array.from(TAB_ALIASES.keys())
-    .sort((a, b) => b.length - a.length)
-    .find((alias) => {
-      const pattern = alias
-        .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-        .replace(/[ _-]+/g, "[\\s_-]+");
-      return new RegExp(`\\b${pattern}\\b`, "i").test(source);
-    });
-  if (!tabAlias) {
-    throw new Error(`Expected email text with one document type: ${Object.values(DOCUMENT_TABS).join(", ")}.`);
-  }
-
-  const requestedType = tabAlias;
-  const tab = normalizeTabName(requestedType);
-  return { matterNo, requestedType, tab, tabSlug: artifactSafeName(tab) };
 }
 
 async function parseRequestWithAi(subject, plainText) {
@@ -262,7 +248,7 @@ function runSearchScript(job) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SEARCH_SCRIPT, job.matterNo, job.requestedType], {
       cwd: ROOT_DIR,
-      env: { ...process.env, DOWNLOAD_LIMIT, ARTIFACTS_DIR: job.artifactsDir },
+      env: { ...process.env, ARTIFACTS_DIR: job.artifactsDir },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -286,13 +272,9 @@ function runSearchScript(job) {
 }
 
 async function createDownloadsZip(job) {
-  const downloadDir = path.join(job.artifactsDir, `${job.matterNo}-${job.tabSlug}-downloads`);
-  const reportPath = path.join(job.artifactsDir, `${job.matterNo}-${job.tabSlug}-downloads.json`);
-  const zipPath = path.join(job.artifactsDir, `${job.matterNo}-${job.tabSlug}-${job.id}.zip`);
-  const documentsPath = path.join(job.artifactsDir, `${job.matterNo}-${job.tabSlug}-documents.json`);
-  const screenshotPath = path.join(job.artifactsDir, `${job.matterNo}-${job.tabSlug}.png`);
+  const { downloadDir, documentsPath, downloadsPath, screenshotPath, zipPath } = jobArtifactPaths(job);
 
-  const report = JSON.parse(await fs.readFile(reportPath, "utf8"));
+  const report = JSON.parse(await fs.readFile(downloadsPath, "utf8"));
   const documents = JSON.parse(await fs.readFile(documentsPath, "utf8"));
   if (!report.succeeded) {
     throw new Error(`No documents downloaded for ${job.matterNo} ${job.tab}.`);
@@ -314,7 +296,7 @@ async function createDownloadsZip(job) {
 }
 
 async function buildReplyText(job, report, documents, screenshotPath) {
-  const downloadedDocs = (report.downloads || []).filter((download) => download.ok);
+  const downloadedDocs = successfulDownloads(report);
   const metadata = {
     matterNo: job.matterNo,
     requestedTab: job.tab,

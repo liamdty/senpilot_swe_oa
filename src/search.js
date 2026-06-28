@@ -7,7 +7,7 @@ const DEBUG = process.env.DEBUG === "1";
 const TIMEOUT_MS = 10_000;
 const KEY_DELAY_MS = 40;
 const FOCUS_SETTLE_MS = 100;
-const DOWNLOAD_LIMIT = Number(process.env.DOWNLOAD_LIMIT || 10);
+const MAX_DOWNLOADS = 10;
 const ARTIFACTS_DIR = process.env.ARTIFACTS_DIR || "artifacts";
 
 const DOCUMENT_TABS = Object.freeze({
@@ -357,10 +357,10 @@ async function closeOpenModal(page) {
   }
 }
 
-function selectDocumentsForDownload(documents, limit = DOWNLOAD_LIMIT) {
+function selectDocumentsForDownload(documents) {
   const publicDocs = documents.filter((doc) => /^Public$/i.test(doc.security));
   const confidentialDocs = documents.filter((doc) => /^Confidential$/i.test(doc.security));
-  return [...publicDocs, ...confidentialDocs].slice(0, limit);
+  return [...publicDocs, ...confidentialDocs].slice(0, MAX_DOWNLOADS);
 }
 
 function expectedDownloadFilename(doc) {
@@ -517,7 +517,7 @@ async function main() {
         tab: selectedTab,
         count: documents.length,
         downloadMethod: "row-go-get-it-popup",
-        downloadLimit: DOWNLOAD_LIMIT,
+        maxDownloads: MAX_DOWNLOADS,
         selectedDownloadCount: selectedDownloads.length,
         documents,
       },
