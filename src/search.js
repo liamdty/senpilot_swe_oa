@@ -296,8 +296,17 @@ async function findVisibleGoGetItPoint(page, docNo) {
 
     const nextDocCell = leftColumnCells.find((cell) => cell.y > docCell.y + 2);
     const rowBottom = nextDocCell ? nextDocCell.y - 2 : docCell.y + 60;
+    const isClickableInViewport = (cell) =>
+      cell.centerX >= 0 &&
+      cell.centerX <= window.innerWidth &&
+      cell.centerY >= 0 &&
+      cell.centerY <= window.innerHeight - 8;
     const actionCell = cells.find(
-      (cell) => cell.text === "GO GET IT" && cell.y >= docCell.y - 2 && cell.y <= rowBottom
+      (cell) =>
+        cell.text === "GO GET IT" &&
+        cell.y >= docCell.y - 2 &&
+        cell.y <= rowBottom &&
+        isClickableInViewport(cell)
     );
     if (!actionCell) return null;
 
